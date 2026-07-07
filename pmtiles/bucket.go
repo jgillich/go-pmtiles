@@ -165,12 +165,23 @@ type HTTPBucket struct {
 	client  HTTPClient
 }
 
-func (b HTTPBucket) NewRangeReader(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {
+// httpStatusError is a typed error carrying the HTTP status code returned
+// by the server for a non-2xx response. isRetryableError inspects it via
+// errors.As to decide whether to retry.
+type httpStatusError struct {
+	Code int
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("HTTP error: %d", e.Code)
+}
+
+func (b *HTTPBucket) NewRangeReader(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {
 	body, _, _, err := b.NewRangeReaderEtag(ctx, key, offset, length, "")
 	return body, err
 }
 
-func (b HTTPBucket) NewRangeReaderEtag(ctx context.Context, key string, offset, length int64, etag string) (io.ReadCloser, string, int, error) {
+func (b *HTTPBucket) NewRangeReaderEtag(ctx context.Context, key string, offset, length int64, etag string) (io.ReadCloser, string, int, error) {
 	reqURL := b.baseURL + "/" + key
 
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
@@ -197,7 +208,7 @@ func (b HTTPBucket) NewRangeReaderEtag(ctx context.Context, key string, offset, 
 		if isRefreshRequiredCode(resp.StatusCode) {
 			err = &RefreshRequiredError{resp.StatusCode}
 		} else {
-			err = fmt.Errorf("HTTP error: %d", resp.StatusCode)
+			err = &httpStatusError{Code: resp.StatusCode}
 		}
 		return nil, "", resp.StatusCode, err
 	}
@@ -205,7 +216,7 @@ func (b HTTPBucket) NewRangeReaderEtag(ctx context.Context, key string, offset, 
 	return resp.Body, resp.Header.Get("ETag"), resp.StatusCode, nil
 }
 
-func (b HTTPBucket) Close() error {
+func (b *HTTPBucket) Close() error {
 	return nil
 }
 
@@ -347,7 +358,7 @@ func NormalizeBucketKey(bucket string, prefix string, key string) (string, strin
 
 func OpenBucket(ctx context.Context, bucketURL string, bucketPrefix string) (Bucket, error) {
 	if strings.HasPrefix(bucketURL, "http") {
-		bucket := HTTPBucket{bucketURL, http.DefaultClient}
+		bucket := &HTTPBucket{bucketURL, http.DefaultClient}
 		return bucket, nil
 	}
 	if strings.HasPrefix(bucketURL, "file") {

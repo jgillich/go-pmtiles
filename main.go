@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/alecthomas/kong"
@@ -60,16 +61,19 @@ var cli struct {
 	} `cmd:"" help:"Edit JSON metadata or parts of the header"`
 
 	Extract struct {
-		Input           string  `arg:"" help:"Input local or remote archive"`
-		Output          string  `arg:"" help:"Output archive" type:"path"`
-		Bucket          string  `help:"Remote bucket of input archive"`
-		Region          string  `help:"local GeoJSON Polygon or MultiPolygon file for area of interest" type:"existingfile"`
-		Bbox            string  `help:"bbox area of interest: min_lon,min_lat,max_lon,max_lat" type:"string"`
-		Minzoom         int8    `default:"-1" help:"Minimum zoom level, inclusive"`
-		Maxzoom         int8    `default:"-1" help:"Maximum zoom level, inclusive"`
-		DownloadThreads int     `default:"4" help:"Number of download threads"`
-		DryRun          bool    `help:"Calculate tiles to extract, but don't download them"`
-		Overfetch       float32 `default:"0.05" help:"What ratio of extra data to download to minimize # requests; 0.2 is 20%"`
+		Input           string        `arg:"" help:"Input local or remote archive"`
+		Output          string        `arg:"" help:"Output archive" type:"path"`
+		Bucket          string        `help:"Remote bucket of input archive"`
+		Region          string        `help:"local GeoJSON Polygon or MultiPolygon file for area of interest" type:"existingfile"`
+		Bbox            string        `help:"bbox area of interest: min_lon,min_lat,max_lon,max_lat" type:"string"`
+		Minzoom         int8          `default:"-1" help:"Minimum zoom level, inclusive"`
+		Maxzoom         int8          `default:"-1" help:"Maximum zoom level, inclusive"`
+		DownloadThreads int           `default:"4" help:"Number of download threads"`
+		DryRun          bool          `help:"Calculate tiles to extract, but don't download them"`
+		Overfetch       float32       `default:"0.05" help:"What ratio of extra data to download to minimize # requests; 0.2 is 20%"`
+		MaxRetries      int           `default:"5" help:"Maximum number of retries per failed range request during tile download (0 = no retries)"`
+		RetryBackoff    time.Duration `default:"1s" help:"Base delay for exponential backoff between retries (max 30s, with jitter)"`
+		MaxRangeSize    string        `default:"1G" help:"Maximum size of a single merged range request (e.g. 256M, 1G); 0 = no limit. Smaller ranges mean cheaper retries."`
 	} `cmd:"" help:"Create an archive from a larger archive for a subset of zoom levels or geographic region"`
 
 	Merge struct {
@@ -180,7 +184,11 @@ func main() {
 			logger.Fatal(startHTTPServer(cli.Serve.Interface+":"+strconv.Itoa(cli.Serve.Port), mux))
 		}
 	case "extract <input> <output>":
-		err := pmtiles.Extract(context.Background(), logger, cli.Extract.Bucket, cli.Extract.Input, cli.Extract.Minzoom, cli.Extract.Maxzoom, cli.Extract.Region, cli.Extract.Bbox, cli.Extract.Output, cli.Extract.DownloadThreads, cli.Extract.Overfetch, cli.Extract.DryRun)
+		maxRangeSize, err := parseSizeBytes(cli.Extract.MaxRangeSize)
+		if err != nil {
+			logger.Fatalf("Invalid --max-range-size: %v", err)
+		}
+		err = pmtiles.Extract(context.Background(), logger, cli.Extract.Bucket, cli.Extract.Input, cli.Extract.Minzoom, cli.Extract.Maxzoom, cli.Extract.Region, cli.Extract.Bbox, cli.Extract.Output, cli.Extract.DownloadThreads, cli.Extract.Overfetch, cli.Extract.DryRun, cli.Extract.MaxRetries, cli.Extract.RetryBackoff, maxRangeSize)
 		if err != nil {
 			logger.Fatalf("Failed to extract, %v", err)
 		}
@@ -270,4 +278,30 @@ func startHTTPServer(addr string, handler http.Handler) error {
 		Handler:           handler,
 	}
 	return server.ListenAndServe()
+}
+
+// parseSizeBytes parses a human-readable size string (e.g. "256M", "1G")
+// into bytes. Suffixes: K/Ki, M/Mi, G/Gi, T/Ti. A value of "0" means no limit.
+func parseSizeBytes(s string) (uint64, error) {
+	s = strings.TrimSpace(s)
+	if s == "0" {
+		return 0, nil
+	}
+	mult := uint64(1)
+	switch {
+	case strings.HasSuffix(s, "G"), strings.HasSuffix(s, "Gi"):
+		mult = 1 << 30
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "Gi"), "G")
+	case strings.HasSuffix(s, "M"), strings.HasSuffix(s, "Mi"):
+		mult = 1 << 20
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "Mi"), "M")
+	case strings.HasSuffix(s, "K"), strings.HasSuffix(s, "Ki"):
+		mult = 1 << 10
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "Ki"), "K")
+	}
+	n, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size %q: %w", s, err)
+	}
+	return n * mult, nil
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"errors"
 	"fmt"
 	"github.com/RoaringBitmap/roaring/roaring64"
 	"github.com/dustin/go-humanize"
@@ -13,6 +14,10 @@ import (
 	"io/ioutil"
 	"log"
 	"math"
+	"math/rand"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"sync"
@@ -148,14 +153,17 @@ type overfetchListItem struct {
 // * an Overfetch parameter
 //   - overfetch = 0.2 means we can request an extra 20%
 //   - overfetch = 1.00 means we can double our total transfer size
+// * a maxRangeSize parameter
+//   - ranges are never merged beyond this size, so each request is
+//     independently retryable without re-downloading huge amounts of data
 //
 // Return a list of OverfetchRanges
 //
 //	Each OverfetchRange is one or more input ranges
 //	input ranges are merged in order of smallest byte distance to next range
-//	until the overfetch budget is consumed.
+//	until the overfetch budget is consumed or the max range size is reached.
 //	The list is sorted by Length
-func mergeRanges(ranges []srcDstRange, overfetch float32) (*list.List, uint64) {
+func mergeRanges(ranges []srcDstRange, overfetch float32, maxRangeSize uint64) (*list.List, uint64) {
 	totalSize := 0
 
 	shortest := make([]*overfetchListItem, len(ranges))
@@ -201,8 +209,14 @@ func mergeRanges(ranges []srcDstRange, overfetch float32) (*list.List, uint64) {
 	for (len(shortest) > 1) && (overfetchBudget-int(shortest[0].BytesToNext) >= 0) {
 		item := shortest[0]
 
-		// merge this item into item.next
+		// skip merge if it would exceed the max range size
 		newLength := item.Rng.Length + item.BytesToNext + item.next.Rng.Length
+		if maxRangeSize > 0 && newLength > maxRangeSize {
+			shortest = shortest[1:]
+			continue
+		}
+
+		// merge this item into item.next
 		item.next.Rng = srcDstRange{item.Rng.SrcOffset, item.Rng.DstOffset, newLength}
 		item.next.prev = item.prev
 		if item.prev != nil {
@@ -233,7 +247,83 @@ func mergeRanges(ranges []srcDstRange, overfetch float32) (*list.List, uint64) {
 	return result, totalBytes
 }
 
-// Extract a smaller archive from local or remote archive.
+// splitRanges breaks any overfetchRange larger than maxRangeSize into
+// multiple chunks. Each chunk is a separate overfetchRange with a single
+// copyDiscard, so it can be downloaded and retried independently.
+// maxRangeSize of 0 means no splitting.
+func splitRanges(ranges *list.List, maxRangeSize uint64) *list.List {
+	if maxRangeSize == 0 {
+		return ranges
+	}
+	result := list.New()
+	for e := ranges.Front(); e != nil; e = e.Next() {
+		or := e.Value.(overfetchRange)
+		if or.Rng.Length <= maxRangeSize {
+			result.PushBack(or)
+			continue
+		}
+		// Walk the CopyDiscards, emitting chunks of at most maxRangeSize.
+		remaining := maxRangeSize
+		srcOff := or.Rng.SrcOffset
+		dstOff := or.Rng.DstOffset
+		chunkCd := copyDiscard{}
+		chunkStarted := false
+		for _, cd := range or.CopyDiscards {
+			wanted := cd.Wanted
+			discard := cd.Discard
+			for wanted > 0 || discard > 0 {
+				if remaining == maxRangeSize {
+					// starting a new chunk
+					chunkStarted = true
+				}
+				takeW := wanted
+				if takeW > remaining {
+					takeW = remaining
+				}
+				chunkCd.Wanted += takeW
+				remaining -= takeW
+				wanted -= takeW
+				srcOff += takeW
+				dstOff += takeW
+				if remaining == 0 {
+					result.PushBack(overfetchRange{
+						Rng:          srcDstRange{srcOff - chunkCd.Wanted - chunkCd.Discard, dstOff - chunkCd.Wanted - chunkCd.Discard, chunkCd.Wanted + chunkCd.Discard},
+						CopyDiscards: []copyDiscard{chunkCd},
+					})
+					chunkCd = copyDiscard{}
+					remaining = maxRangeSize
+					chunkStarted = false
+				}
+				if wanted == 0 && discard > 0 {
+					takeD := discard
+					if takeD > remaining {
+						takeD = remaining
+					}
+					chunkCd.Discard += takeD
+					remaining -= takeD
+					discard -= takeD
+					srcOff += takeD
+					if remaining == 0 {
+						result.PushBack(overfetchRange{
+							Rng:          srcDstRange{srcOff - chunkCd.Wanted - chunkCd.Discard, dstOff - chunkCd.Wanted, chunkCd.Wanted + chunkCd.Discard},
+							CopyDiscards: []copyDiscard{chunkCd},
+						})
+						chunkCd = copyDiscard{}
+						remaining = maxRangeSize
+						chunkStarted = false
+					}
+				}
+			}
+		}
+		if chunkStarted {
+			result.PushBack(overfetchRange{
+				Rng:          srcDstRange{srcOff - chunkCd.Wanted - chunkCd.Discard, dstOff - chunkCd.Wanted, chunkCd.Wanted + chunkCd.Discard},
+				CopyDiscards: []copyDiscard{chunkCd},
+			})
+		}
+	}
+	return result
+}
 // 1. Get the root directory (check that it is clustered)
 // 2. Turn the input geometry into a relevance bitmap (using min(maxzoom, headermaxzoom))
 // 3. Get all relevant level 1 directories (if any)
@@ -248,9 +338,19 @@ func mergeRanges(ranges []srcDstRange, overfetch float32) (*list.List, uint64) {
 // 9. get and write the metadata.
 // 10. write the leaf directories (if any)
 // 11. Get all tiles, and write directly to the output.
-func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key string, minzoom int8, maxzoom int8, regionFile string, bbox string, output string, downloadThreads int, overfetch float32, dryRun bool) error {
+func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key string, minzoom int8, maxzoom int8, regionFile string, bbox string, output string, downloadThreads int, overfetch float32, dryRun bool, maxRetries int, retryBackoff time.Duration, maxRangeSize uint64) error {
 	// 1. fetch the header
 	start := time.Now()
+
+	// Clamp negative retry params to 0 and warn so typos are not silent.
+	if maxRetries < 0 {
+		logger.Printf("warning: maxRetries=%d is negative; clamping to 0 (no retries)\n", maxRetries)
+		maxRetries = 0
+	}
+	if retryBackoff < 0 {
+		logger.Printf("warning: retryBackoff=%v is negative; clamping to 0 (retry immediately)\n", retryBackoff)
+		retryBackoff = 0
+	}
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -368,7 +468,8 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 		leafRanges = append(leafRanges, srcDstRange{header.LeafDirectoryOffset + leaf.Offset, 0, uint64(leaf.Length)})
 	}
 
-	overfetchLeaves, _ := mergeRanges(leafRanges, overfetch)
+	overfetchLeaves, _ := mergeRanges(leafRanges, overfetch, maxRangeSize)
+	overfetchLeaves = splitRanges(overfetchLeaves, maxRangeSize)
 	numOverfetchLeaves := overfetchLeaves.Len()
 	logger.Printf("fetching %d dirs, %d chunks, %d requests\n", len(leaves), len(leafRanges), overfetchLeaves.Len())
 
@@ -378,32 +479,38 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 		}
 		or := overfetchLeaves.Remove(overfetchLeaves.Front()).(overfetchRange)
 
-		chunkReader, err := bucket.NewRangeReader(ctx, key, int64(or.Rng.SrcOffset), int64(or.Rng.Length))
+		desc := fmt.Sprintf("leaf dir (src=%d, len=%d)", or.Rng.SrcOffset, or.Rng.Length)
+		err := withRetry(ctx, logger, maxRetries, retryBackoff, desc, func() error {
+			chunkReader, err := bucket.NewRangeReader(ctx, key, int64(or.Rng.SrcOffset), int64(or.Rng.Length))
+			if err != nil {
+				return err
+			}
+			defer chunkReader.Close()
+
+			for _, cd := range or.CopyDiscards {
+				leafBytes := make([]byte, cd.Wanted)
+				_, err := io.ReadFull(chunkReader, leafBytes)
+				if err != nil {
+					return err
+				}
+				leafdir := DeserializeEntries(bytes.NewBuffer(leafBytes), header.InternalCompression)
+				newEntries, newLeaves := RelevantEntries(relevantSet, uint8(maxzoom), leafdir)
+
+				if len(newLeaves) > 0 {
+					panic("This doesn't support leaf level 2+.")
+				}
+				tileEntries = append(tileEntries, newEntries...)
+
+				_, err = io.CopyN(io.Discard, chunkReader, int64(cd.Discard))
+				if err != nil {
+					return err
+				}
+			}
+			return nil
+		})
 		if err != nil {
 			return err
 		}
-
-		for _, cd := range or.CopyDiscards {
-
-			leafBytes := make([]byte, cd.Wanted)
-			_, err := io.ReadFull(chunkReader, leafBytes)
-			if err != nil {
-				return err
-			}
-			leafdir := DeserializeEntries(bytes.NewBuffer(leafBytes), header.InternalCompression)
-			newEntries, newLeaves := RelevantEntries(relevantSet, uint8(maxzoom), leafdir)
-
-			if len(newLeaves) > 0 {
-				panic("This doesn't support leaf level 2+.")
-			}
-			tileEntries = append(tileEntries, newEntries...)
-
-			_, err = io.CopyN(io.Discard, chunkReader, int64(cd.Discard))
-			if err != nil {
-				return err
-			}
-		}
-		chunkReader.Close()
 	}
 
 	sort.Slice(tileEntries, func(i, j int) bool {
@@ -416,7 +523,8 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 	// we now need to re-encode this entry list using cumulative offsets
 	reencoded, tileParts, tiledataLength, addressedTiles, tileContents := reencodeEntries(tileEntries)
 
-	overfetchRanges, totalBytes := mergeRanges(tileParts, overfetch)
+	overfetchRanges, totalBytes := mergeRanges(tileParts, overfetch, maxRangeSize)
+	overfetchRanges = splitRanges(overfetchRanges, maxRangeSize)
 
 	numOverfetchRanges := overfetchRanges.Len()
 	logger.Printf("fetching %d tiles, %d chunks, %d requests\n", len(reencoded), len(tileParts), overfetchRanges.Len())
@@ -506,30 +614,15 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 
 		var mu sync.Mutex
 
+		// Use the errgroup's derived context so a permanent error in one
+		// worker cancels sibling workers promptly.
+		errs, ctx := errgroup.WithContext(ctx)
+
+		// downloadPart fetches an overfetchRange with retry on transient errors.
+		// maxRetries=5 means up to 6 total attempts (attempt 0..5).
 		downloadPart := func(or overfetchRange) error {
-			tileReader, err := bucket.NewRangeReader(ctx, key, int64(sourceTileDataOffset+or.Rng.SrcOffset), int64(or.Rng.Length))
-			if err != nil {
-				return err
-			}
-			offsetWriter := io.NewOffsetWriter(outfile, int64(header.TileDataOffset)+int64(or.Rng.DstOffset))
-
-			for _, cd := range or.CopyDiscards {
-
-				_, err := io.CopyN(io.MultiWriter(offsetWriter, bar), tileReader, int64(cd.Wanted))
-				if err != nil {
-					return err
-				}
-
-				_, err = io.CopyN(bar, tileReader, int64(cd.Discard))
-				if err != nil {
-					return err
-				}
-			}
-			tileReader.Close()
-			return nil
+			return downloadWithRetry(ctx, logger, bucket, key, or, sourceTileDataOffset, header.TileDataOffset, outfile, bar, maxRetries, retryBackoff)
 		}
-
-		errs, _ := errgroup.WithContext(ctx)
 
 		for i := 0; i < downloadThreads; i++ {
 			workBack := (i == 0 && downloadThreads > 1)
@@ -584,4 +677,144 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 	logger.Printf("Extract transferred %s (overfetch %v) for an archive size of %s\n", humanize.Bytes(totalBytes), overfetch, humanize.Bytes(totalActualBytes))
 
 	return nil
+}
+
+// isRetryableError reports whether err represents a transient failure
+// that may succeed on retry. Non-retryable errors include context
+// cancellation, permanent HTTP 4xx (other than 408/429), and nil.
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return true
+	}
+	// net.OpError: retry transient network errors (connection reset, etc.).
+	// This is intentionally permissive — retrying a permanent error only
+	// costs a few attempts, while failing fast on a transient one loses the
+	// whole extract.
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		return true
+	}
+	// url.Error: retry if it wraps a timeout or an unexpected EOF.
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		if urlErr.Timeout() {
+			return true
+		}
+		if errors.Is(urlErr.Err, io.ErrUnexpectedEOF) || errors.Is(urlErr.Err, io.EOF) {
+			return true
+		}
+		// url.Error wrapping a net.OpError (e.g. connection reset) is retryable.
+		var innerNetErr *net.OpError
+		if errors.As(urlErr.Err, &innerNetErr) {
+			return true
+		}
+		return false
+	}
+	// Typed HTTP status errors from NewRangeReaderEtag.
+	var httpErr *httpStatusError
+	if errors.As(err, &httpErr) {
+		switch {
+		case httpErr.Code == http.StatusRequestTimeout, httpErr.Code == http.StatusTooManyRequests:
+			return true
+		case httpErr.Code >= 500 && httpErr.Code <= 599:
+			return true
+		default:
+			return false
+		}
+	}
+	// Default: do not retry unknown errors.
+	return false
+}
+
+// backoffDuration returns the delay before retrying the given attempt
+// (1-based). The delay is exponential with jitter, capped at 30 seconds.
+//
+//	delay = min(base * 2^(attempt-1) + jitter, 30s)
+//
+// where jitter is uniform in [0, base). A base of 0 yields 0 (no delay).
+func backoffDuration(attempt int, base time.Duration) time.Duration {
+	if base <= 0 || attempt < 1 {
+		return 0
+	}
+	const cap30 = 30 * time.Second
+	shift := uint(attempt - 1)
+	if shift > 30 {
+		shift = 30 // prevent overflow on very high attempt counts
+	}
+	d := base * (1 << shift)
+	if d >= cap30 {
+		return cap30
+	}
+	// jitter in [0, base)
+	jitter := time.Duration(rand.Int63n(int64(base)))
+	d += jitter
+	if d > cap30 {
+		return cap30
+	}
+	return d
+}
+
+// withRetry calls fn up to maxRetries+1 times, retrying on transient errors
+// with exponential backoff + jitter. It logs retry attempts and respects
+// context cancellation during backoff. Non-retryable errors fail fast.
+func withRetry(ctx context.Context, logger *log.Logger, maxRetries int, retryBackoff time.Duration, desc string, fn func() error) error {
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			delay := backoffDuration(attempt, retryBackoff)
+			logger.Printf("retrying %s attempt %d/%d after %v: %v\n", desc, attempt, maxRetries, delay, lastErr)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isRetryableError(err) {
+			return err
+		}
+	}
+	return fmt.Errorf("%s failed after %d retries: %w", desc, maxRetries, lastErr)
+}
+
+// downloadRangeOnce fetches a single overfetchRange and writes it to the
+// output file at the range's DstOffset. It does not retry.
+func downloadRangeOnce(ctx context.Context, bucket Bucket, key string, or overfetchRange, sourceTileDataOffset uint64, tileDataOffset uint64, outfile *os.File, bar io.Writer) error {
+	tileReader, err := bucket.NewRangeReader(ctx, key, int64(sourceTileDataOffset+or.Rng.SrcOffset), int64(or.Rng.Length))
+	if err != nil {
+		return err
+	}
+	defer tileReader.Close()
+	offsetWriter := io.NewOffsetWriter(outfile, int64(tileDataOffset)+int64(or.Rng.DstOffset))
+
+	for _, cd := range or.CopyDiscards {
+		_, err := io.CopyN(io.MultiWriter(offsetWriter, bar), tileReader, int64(cd.Wanted))
+		if err != nil {
+			return err
+		}
+		_, err = io.CopyN(bar, tileReader, int64(cd.Discard))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// downloadWithRetry fetches an overfetchRange with retry on transient errors.
+// maxRetries=5 means up to 6 total attempts (attempt 0..5).
+func downloadWithRetry(ctx context.Context, logger *log.Logger, bucket Bucket, key string, or overfetchRange, sourceTileDataOffset uint64, tileDataOffset uint64, outfile *os.File, bar io.Writer, maxRetries int, retryBackoff time.Duration) error {
+	desc := fmt.Sprintf("range (src=%d, len=%d)", or.Rng.SrcOffset, or.Rng.Length)
+	return withRetry(ctx, logger, maxRetries, retryBackoff, desc, func() error {
+		return downloadRangeOnce(ctx, bucket, key, or, sourceTileDataOffset, tileDataOffset, outfile, bar)
+	})
 }
